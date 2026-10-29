@@ -4,8 +4,6 @@ public class IssueFieldsDto {
     private ProjectDto project;
     private String summary;
     private IssueTypeDto issuetype;
-    private java.util.List<String> labels;
-    private java.util.Map<String, Object> description;
 
     // Construtor vazio (necessário se o Jackson for desserializar)
     public IssueFieldsDto() {
@@ -39,20 +37,5 @@ public class IssueFieldsDto {
 
     public void setIssuetype(IssueTypeDto issuetype) {
         this.issuetype = issuetype;
-    }
-    public java.util.List<String> getLabels() {
-        return labels;
-    }
-
-    public void setLabels(java.util.List<String> labels) {
-        this.labels = labels;
-    }
-
-    public java.util.Map<String, Object> getDescription() {
-        return description;
-    }
-
-    public void setDescription(java.util.Map<String, Object> description) {
-        this.description = description;
     }
 }

@@ -41,5 +41,3 @@ build/
 ### Segredos e build ###
 .env
 target/
-
-/estado/
