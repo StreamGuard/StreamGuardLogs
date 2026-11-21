@@ -22,9 +22,12 @@ public final class Estado implements AutoCloseable {
         public String configuracao;
         public String ativa;
         public int recuperacoes;
+        public long ultimaTentativaJira;
+        public long ultimaTentativaSlack;
     }
 
     public static class Ocorrencia {
+        public boolean teste;
         public String id;
         public long servidor;
         public String tipo;
@@ -40,6 +43,15 @@ public final class Estado implements AutoCloseable {
         public Envio envio = Envio.PENDENTE;
         public String issueKey;
         public long proximaTentativa;
+        public long empresa;
+        public String hostname;
+        public String componente;
+        public String ultimaAmostra;
+        public long revisao;
+        public long revisaoJira;
+        public long revisaoSlack;
+        public Envio envioSlack = Envio.PENDENTE;
+        public long proximaTentativaSlack;
     }
 
     public static class Dados {
@@ -86,6 +98,7 @@ public final class Estado implements AutoCloseable {
                         throw new IOException("Ocorrência persistida inválida.");
                     }
                     if (o.envio == Envio.ENVIANDO) o.envio = Envio.AMBIGUA;
+                    if (o.envioSlack == Envio.ENVIANDO) o.envioSlack = Envio.AMBIGUA;
                 }
             } else {
                 dados = new Dados();
@@ -112,6 +125,24 @@ public final class Estado implements AutoCloseable {
             ultimoConteudo = bytes;
         } catch (IOException erro) {
             throw new IllegalStateException("Falha ao persistir estado; não prossiga com envios.", erro);
+        }
+    }
+
+    /** Histórico independente do checkpoint, preservado no mesmo volume do container. */
+    public void registrarEvento(Map<String, Object> evento) {
+        salvar();
+        Path historico = arquivo.resolveSibling("alertas.jsonl");
+        try {
+            byte[] bytes = (mapper.writer().without(SerializationFeature.INDENT_OUTPUT).writeValueAsString(evento) + "\n")
+                  .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try (FileChannel saida = FileChannel.open(historico, StandardOpenOption.CREATE,
+                  StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+                ByteBuffer buffer = ByteBuffer.wrap(bytes);
+                while (buffer.hasRemaining()) saida.write(buffer);
+                saida.force(true);
+            }
+        } catch (IOException erro) {
+            throw new IllegalStateException("Falha ao gravar histórico de alertas; execução interrompida.", erro);
         }
     }
 

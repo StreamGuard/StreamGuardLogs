@@ -1,94 +1,133 @@
 # StreamGuardLogs
 
-Aplicação Java 21 que avalia métricas da Silver pelos limites cadastrados no StreamGuard e prepara chamados no Jira. A notificação no Slack pertence à automação do Jira.
+Serviço Java responsável por avaliar métricas da camada Silver do S3, consultar os limites configurados no MySQL e enviar alertas ao Jira e ao Slack. Executa em container Docker na EC2 e mantém o histórico das ocorrências em volume persistente.
+
+## Fluxo de processamento
 
 ```text
-Captura Python real/simulada -> Bronze -> ETL Pandas -> Silver -> Java -> Jira -> Slack
+Captura → S3 Bronze → ETL → S3 Silver → Java → Jira e Slack
+                                        ↑
+                               MySQL / config_metrica
 ```
 
-## Funcionamento
+O serviço consulta `config_metrica` a cada 60 segundos e lê os arquivos `silver/<empresa>/<dia>/metricas.csv`. A avaliação considera a amostra mais recente por servidor e tipo de métrica, os limites mínimo e máximo, a unidade e o estado da configuração.
 
-O Java consulta `silver/atual/metricas.csv` no bucket configurado. O CSV deve conter `servidor_id,timestamp,tipo,valor,unidade`, conforme a ETL. A Gold e o CSV de processos não são fontes deste avaliador. Não há geração de métricas no Java.
+São aceitos os dois esquemas de banco utilizados pelo StreamGuard: vínculos por `equipamento_componente` ou componentes associados diretamente ao servidor. A estrutura é identificada pelos metadados JDBC, sem executar migrações. No esquema legado, o vínculo da empresa é confirmado pela chave estrangeira.
 
-O ETag evita downloads repetidos. O GET S3 usa If-Match para recusar um arquivo alterado durante a leitura. O conteúdo é lido como UTF-8, validado e ordenado; registros inválidos são rejeitados, duplicatas iguais são ignoradas e identidades conflitantes não escolhem arbitrariamente um valor.
+## Regras dos alertas
 
-As configurações vêm de `GET /metricas/configuracoes/:servidor_id`, sem novo endpoint ou acesso direto ao MySQL. A consulta é agrupada por servidor e possui cache curto. Configurações ausentes, desabilitadas ou sem limites aplicáveis não produzem alertas. Se o cache vencer e a API falhar, o servidor aguarda uma configuração válida; não são inventados limites.
+- Um valor abaixo do mínimo ou acima do máximo gera uma ocorrência. Igualdade com o limite é permitida.
+- Configurações desabilitadas ou sem limites aplicáveis não geram alertas.
+- Cada servidor/tipo de métrica possui uma ocorrência ativa. CPU, RAM, disco, rede e suas métricas têm controles independentes.
+- A primeira violação cria um chamado Jira. Enquanto persistir, o serviço atualiza esse chamado.
+- Cada integração respeita um intervalo mínimo de **cinco minutos entre tentativas**, inclusive após reiniciar o container.
+- Uma atualização exige nova avaliação. Consultar novamente o mesmo dado não repete a notificação.
+- Duas amostras válidas dentro dos limites confirmam a recuperação local. O encerramento do chamado continua sob controle do workflow do Jira.
 
-Uma violação ocorre abaixo do mínimo ou acima do máximo. Igualdade com o limite é permitida. Percentuais, bytes, bytes/s e carga mantêm suas próprias unidades. Os intervalos de coleta configurados controlam a distância mínima entre avaliações; o polling não substitui esses intervalos.
+Por padrão, amostras com mais de 15 minutos, futuras, inválidas ou incompatíveis com a unidade configurada são descartadas. O início do monitoramento é persistido na primeira execução; amostras anteriores a esse início não geram ocorrências. A recuperação aceita a periodicidade dos lotes da ETL; lacunas maiores que a validade da amostra ou três intervalos de coleta, o que for maior, reiniciam a contagem.
 
-## Ocorrências e persistência
+O formato esperado da Silver é:
 
-Cada servidor/tipo possui checkpoint e no máximo uma ocorrência ativa. Ela começa na primeira violação e continua sem novos chamados enquanto não houver recuperação confirmada. Por padrão, duas amostras válidas na faixa permitida confirmam a recuperação; intervalos excessivos ou registros inválidos interrompem essa contagem.
+```csv
+servidor_id,timestamp,tipo,valor,unidade
+```
 
-A recuperação é registrada localmente e permite uma nova ocorrência. O Java não fecha ou transiciona chamados automaticamente: isso depende do workflow do Jira. Mudanças de configuração encerram o contexto anterior e cancelam pendências ainda não enviadas com limites antigos. Amostras já processadas não são reaplicadas com um limite novo.
+Os tipos incluem uso de CPU/RAM/disco, carga da CPU, memória disponível, taxas de disco/rede e inventário. Percentuais, bytes, bytes/s, segundos e carga são comparados em suas próprias unidades. O legado `Uso` em `%` é reconhecido para CPU, RAM e disco; não são inferidas conversões de unidade ou direção de tráfego. Duplicatas conflitantes são rejeitadas e configurações duplicadas para um servidor/tipo suspendem a avaliação.
 
-`ESTADO_DIRETORIO/estado.json` contém checkpoints, ocorrências e confirmações Jira. A escrita usa arquivo temporário, force e troca atômica no mesmo diretório. A trava impede dois processos no mesmo diretório. Falhas de persistência interrompem a execução; estado corrompido não é substituído por um estado vazio.
+## Requisitos
 
-Use uma instância por fluxo e preserve esse diretório em disco durável nas reinicializações. Não execute réplicas com diretórios independentes para a mesma Silver. Não apague nem edite o estado para repetir um envio.
+- Docker e Docker Compose na EC2.
+- MySQL acessível pela rede Docker, com um usuário dedicado que possua SELECT nas tabelas do StreamGuard.
+- IAM Role da EC2 com acesso de leitura às partições Silver do bucket.
+- Conta Jira com permissões para pesquisar, criar e editar chamados no projeto.
+- Incoming Webhook do canal Slack destinado às notificações.
+- Java 21 e Maven para desenvolvimento local; o Dockerfile fornece as ferramentas necessárias ao build.
 
-Na primeira execução, apenas amostras a partir do início do monitoramento geram ocorrências. O instante inicial é persistido. `ALERTAS_DESDE` permite definir explicitamente outro início em um diretório novo, inclusive para replay controlado. Alterá-lo não redefine um estado existente. Timestamps anteriores ao checkpoint de cada métrica são ignorados, incluindo chegadas tardias; não há reavaliação retroativa de chamados.
+## Configuração
 
-## Jira
+`.env.example` contém somente o modelo. Na implantação, os valores ficam em **`/home/ubuntu/streamguard/java.env`**, fora do repositório e da imagem. O Java recebe variáveis de ambiente e não carrega `.env` automaticamente.
 
-O envio fica desligado por padrão. `JIRA_ENVIAR=false` impede tanto busca quanto criação no Jira, mas a leitura real do S3 e da API continua ativa.
+| Variável | Finalidade | Padrão |
+|---|---|---|
+| `DB_HOST`, `DB_PORT`, `DB_DATABASE` | Endereço do MySQL | Porta `3306` |
+| `DB_USER`, `DB_PASSWORD` | Usuário dedicado de leitura | Obrigatórios |
+| `DB_SSL_MODE` | Modo TLS do JDBC | `PREFERRED` |
+| `S3_BUCKET` | Bucket que contém a Silver | Obrigatório |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | Região AWS | `us-east-1` |
+| `CAPTURA_FUSO` | Fuso dos timestamps sem offset | `America/Sao_Paulo` |
+| `ESTADO_DIRETORIO` | Checkpoints e histórico persistente | `/estado` |
+| `ALERTAS_INTERVALO_SEGUNDOS` | Polling do S3 | `15` |
+| `CONFIG_INTERVALO_SEGUNDOS` | Renovação dos limites | `60` |
+| `SILVER_MAX_IDADE_SEGUNDOS` | Validade máxima das amostras | `900` |
+| `SILVER_MAX_BYTES` | Tamanho máximo de cada arquivo | `67108864` |
+| `RECUPERACAO_AMOSTRAS` | Amostras normais para recuperação | `2` |
+| `HTTP_TIMEOUT_SEGUNDOS` | Timeout Jira/Slack | `30` |
+| `JIRA_ENVIAR`, `SLACK_ENVIAR` | Habilitação independente das entregas | `false` |
+| `JIRA_DOMAIN` ou `JIRA_BASE_URL` | Endereço do Jira | Obrigatório ao habilitar Jira |
+| `JIRA_EMAIL`, `JIRA_API_TOKEN` | Autenticação Jira | Obrigatórios ao habilitar Jira |
+| `JIRA_PROJECT_KEY`, `JIRA_ISSUE_TYPE` | Projeto e nome exato do tipo de chamado | Tipo padrão `Incident` |
+| `SLACK_WEBHOOK_URL` | Webhook do canal Slack | Obrigatório ao habilitar Slack |
 
-Quando habilitado, o cliente reutiliza os DTOs existentes e envia projeto, tipo, resumo, descrição ADF e labels. O contexto informa servidor, métrica, valor, limite, unidade, horário e identificação estável da ocorrência. A autenticação vem de e-mail/token privados, via HTTPS; HTTP só é aceito para loopback nos testes.
+`ALERTAS_DESDE` aceita um horário local ISO sem offset, como `2026-11-19T12:00:00`, somente para definir o início de um estado novo. `SILVER_CHAVE` permite selecionar explicitamente outro objeto, inclusive o caminho legado `silver/atual/metricas.csv`.
 
-Antes do POST, busca o identificador em `/rest/api/3/search/jql`. O estado ENVIANDO é gravado antes de transmitir. Só HTTP 201 com chave válida, ou uma busca que confirme um único chamado, marca a ocorrência ENVIADA.
+Use o nome de tipo disponibilizado pelo projeto Jira, por exemplo `[System] Incident` quando aplicável. Falhas de renovação das configurações suspendem os envios até que o banco volte a responder. Os limites não são substituídos por valores fixos do código.
 
-Rejeições conhecidas (400, 401, 403, 404, 405, 413, 415, 422 e 429) permitem nova tentativa após espera e nova busca; Retry-After em segundos é respeitado até 24 horas. Timeout, 5xx, respostas desconhecidas ou sucesso sem chave ficam AMBIGUA. Nessas situações, o Java repete somente a busca, sem repetir o POST cegamente. Se não houver confirmação ou existirem múltiplos resultados, a pendência exige revisão manual no Jira; não apague o checkpoint.
+## Execução na EC2
 
-Não existe garantia distribuída de exatamente uma vez entre Jira e arquivo local. A estratégia prioriza evitar duplicações, podendo manter uma pendência sem reenviar quando o resultado for incerto. A indexação de busca do Jira pode ter atraso.
+O Compose deste repositório executa somente o worker e utiliza a rede existente `streamguard_default` para acessar o banco. O arquivo privado `java.env` deve estar na pasta imediatamente acima do checkout.
 
-## Configuração e execução
+```text
+/home/ubuntu/streamguard/
+├── java.env
+└── StreamGuardLogs/
+    ├── Dockerfile
+    ├── compose.ec2.yaml
+    ├── pom.xml
+    └── src/
+```
 
-Requer JDK 21, Maven, acesso de leitura ao objeto Silver no S3, API disponível e diretório de estado gravável. As dependências operacionais são Jackson, Apache Commons CSV e os módulos S3/HTTP do AWS SDK Java v2.
+```bash
+cd /home/ubuntu/streamguard/StreamGuardLogs
+sudo docker compose --project-name streamguard -f compose.ec2.yaml up -d --build java
+sudo docker compose --project-name streamguard -f compose.ec2.yaml ps
+sudo docker compose --project-name streamguard -f compose.ec2.yaml logs --tail 100 java
+```
 
-`.env.example` lista as variáveis; Java não carrega esse arquivo automaticamente. Configure-as no ambiente do processo. Credenciais AWS devem vir da cadeia padrão do SDK, preferencialmente função IAM na EC2 ou perfil local. Não coloque chaves no código ou em arquivos versionados.
+A imagem executa os testes durante o build e utiliza um usuário sem root no runtime. `restart: unless-stopped` mantém o processo ativo; o volume `streamguard_estado_java` preserva o controle de ocorrências. Execute uma única instância por fluxo e mantenha o volume ao atualizar a imagem.
 
-| Variável | Uso/padrão |
+A autenticação S3 utiliza a cadeia padrão do AWS SDK, preferencialmente a IAM Role da EC2. Em rede bridge com IMDSv2, a instância precisa permitir o acesso ao metadata service a partir dos containers.
+
+## Entregas e histórico
+
+As mensagens contêm servidor, componente, métrica, valor, limite, unidade, horário e identificador da ocorrência. O Slack inclui o link do chamado quando a chave Jira já foi confirmada e pode notificar mesmo se o Jira estiver indisponível. Sucesso ou falha de cada integração é registrado separadamente. Para evitar duplicidade, utilize apenas um caminho de notificação ao canal: webhook direto do Java ou automação Jira → Slack equivalente.
+
+O Jira utiliza labels estáveis para reconciliar criações cuja resposta foi incerta. Atualizações usam PUT dos campos do chamado. Timeout de criação não provoca um novo POST sem confirmação. No Slack, uma resposta ambígua permanece pendente de revisão, pois o webhook não oferece uma consulta para confirmar a mensagem. Não há transação distribuída entre serviços externos e os arquivos locais.
+
+O volume contém:
+
+| Arquivo | Conteúdo |
 |---|---|
-| S3_BUCKET | Bucket da Silver, sem s3://; obrigatório. |
-| AWS_REGION / AWS_DEFAULT_REGION | Região; padrão us-east-1. |
-| WEB_DATA_VIZ_URL | Base da API; obrigatório. |
-| CAPTURA_FUSO | Fuso dos timestamps sem offset da captura; padrão America/Sao_Paulo. Deve coincidir com a captura. |
-| ESTADO_DIRETORIO | Diretório durável; padrão estado. |
-| ALERTAS_INTERVALO_SEGUNDOS | Polling da Silver; padrão 15. |
-| CONFIG_INTERVALO_SEGUNDOS | Validade das configurações; padrão 60. |
-| RECUPERACAO_AMOSTRAS | Confirmação da recuperação; padrão 2. |
-| SILVER_MAX_BYTES | Tamanho máximo aceito; padrão 67108864 (64 MiB). |
-| ALERTAS_DESDE | Início ISO local opcional, sem offset; padrão início da primeira execução. |
-| JIRA_ENVIAR | true ou false; padrão false. |
-| JIRA_BASE_URL | Site Jira Cloud; obrigatório ao habilitar envio. |
-| JIRA_EMAIL / JIRA_API_TOKEN | Conta técnica e token privados. |
-| JIRA_PROJECT_KEY | Chave do projeto autorizado. |
-| JIRA_ISSUE_TYPE | Nome do tipo permitido no projeto; padrão Task. |
-| JIRA_TIMEOUT_SEGUNDOS | Timeout HTTP; padrão 30. |
-| JIRA_RETRY_SEGUNDOS | Espera mínima entre tentativas; padrão 60. |
+| `estado.json` | Checkpoints, ocorrências, chave Jira e controle de intervalos |
+| `alertas.jsonl` | Histórico JSON por linha: avaliações, tentativas, confirmações, falhas e recuperação |
+| `execucao.lock` | Trava para impedir processos concorrentes no mesmo diretório |
 
-```shell
-mvn package
-java -jar target/StreamGuardLogs-1.0-SNAPSHOT-jar-with-dependencies.jar
+```bash
+sudo docker compose --project-name streamguard -f compose.ec2.yaml exec java tail -n 50 /estado/alertas.jsonl
 ```
 
-Encerre com Ctrl+C. A trava do sistema operacional é liberada ao terminar; o arquivo lock pode permanecer e não precisa ser apagado. Em Windows, se necessário, passe as opções de console UTF-8 entre aspas: `"-Dstdout.encoding=UTF-8" "-Dstderr.encoding=UTF-8"` antes de `-jar`.
+Cada evento inclui ambiente, instante, ID da ocorrência, empresa, servidor, componente, métrica, valor, limite, revisão e situação das entregas. Senhas, tokens e webhook não são registrados. Falhas de persistência interrompem a execução para evitar continuar enviando sem conseguir gravar o histórico.
 
-## Automação Jira -> Slack
+## Homologação isolada
 
-Solicite ao responsável a URL do Jira Cloud, projeto, tipo de chamado, e-mail/token da conta técnica e acesso para criar e pesquisar chamados. Confirme permissões Browse Projects/Create Issues, visibilidade das issues e disponibilidade dos campos Summary, Description e Labels na criação. Verifique campos obrigatórios adicionais antes de habilitar o envio.
+O modo `ALERTAS_TESTE=true` exige `SILVER_CHAVE` sob o prefixo **`homologacao/alertas/`**. Utilize um diretório de estado exclusivo para o teste e uma amostra com horário atual. O serviço continua consultando os limites reais no banco, mas identifica as notificações como **`[HOMOLOGAÇÃO]`** e informa que a medição é sintética.
 
-No Jira Automation, configure um gatilho de issue criada no projeto, condição label `streamguard` e ação Send Slack message para o canal aprovado. Autorize a conexão do workspace ou o incoming webhook exigido pela ação, armazenando esse segredo no Jira, não no Java. Uma mensagem pode usar `{{issue.key}}`, `{{issue.summary}}` e `{{issue.url}}`. Verifique também o ator, escopo, permissões, limites da automação e audit log.
+As ocorrências de homologação possuem identidade separada das ocorrências reais. Esse modo permite validar envio, atualização após cinco minutos e persistência após reinício sem alterar limites ou arquivos da produção.
 
-O Java não usa webhooks Slack. A existência e a entrega da regra externa precisam ser confirmadas com os administradores. Referência: [automação oficial com Slack](https://support.atlassian.com/cloud-automation/docs/use-automation-with-slack/).
+## Desenvolvimento e testes
 
-## Homologação controlada
+```bash
+mvn verify
+docker build -t streamguard-alertas .
+```
 
-1. Obtenha autorização explícita antes de habilitar qualquer envio real. Confirme projeto, canal, tipo e campos com o responsável.
-2. Mantenha JIRA_ENVIAR=false enquanto verifica S3, API, fuso e estado. Esse modo ainda acessa S3/API reais quando executado com suas configurações.
-3. Combine uma janela com uma única violação controlada, usando os limites editáveis do sistema. Evite outras métricas/servidores em violação na mesma janela.
-4. Pare a instância anterior e use um diretório dedicado de homologação, com início atual. Inspecione as pendências antes de ativar envio; habilitar um estado antigo pode enviar ocorrências acumuladas.
-5. Configure as credenciais privadas, habilite JIRA_ENVIAR e acompanhe o estado até confirmar a chave de um chamado. Interrompa a execução após a validação combinada.
-6. Confira o conteúdo no Jira, o audit log da regra e uma única mensagem no canal Slack. Reinicie com o mesmo estado para conferir a ausência de duplicação e confirme recuperação local.
-7. Em erro ou ambiguidade, desabilite envio e revise o Jira pelo label da ocorrência. Não remova o estado para tentar novamente.
-
-A leitura S3 com IAM, os campos/permissões do projeto Jira, a automação Slack e o comportamento na infraestrutura real permanecem sujeitos à homologação. Testes locais usam mocks e CSVs fora deste repositório; não comprovam entrega real. Não há configuração Docker neste projeto.
+Os testes automatizados usam relógio controlado, H2 em modo MySQL, cliente S3 simulado e servidores HTTP locais. Cobrem os dois esquemas de banco, limites, isolamento por empresa, ETag, duplicatas, recuperação, intervalo de cinco minutos, falhas parciais, histórico persistente e reinício. A homologação na EC2 complementa esses testes com MySQL, S3, Jira e Slack reais.

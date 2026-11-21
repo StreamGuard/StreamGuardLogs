@@ -11,7 +11,9 @@ public final class Modelo {
           Map.entry("CARGA_CPU_1M", "load"), Map.entry("CARGA_CPU_5M", "load"),
           Map.entry("CARGA_CPU_15M", "load"),
           Map.entry("TAXA_LEITURA_DISCO", "bytes/s"), Map.entry("TAXA_ESCRITA_DISCO", "bytes/s"),
-          Map.entry("TAXA_ENVIO_REDE", "bytes/s"), Map.entry("TAXA_RECEBIMENTO_REDE", "bytes/s"));
+          Map.entry("TAXA_ENVIO_REDE", "bytes/s"), Map.entry("TAXA_RECEBIMENTO_REDE", "bytes/s"),
+          Map.entry("MEMORIA_TOTAL", "bytes"), Map.entry("DISCO_TOTAL", "bytes"),
+          Map.entry("UPTIME", "s"), Map.entry("CAPACIDADE_REDE", "bytes/s"));
 
     public record Medicao(long servidor, LocalDateTime instante, String tipo, BigDecimal valor, String unidade) {
         public String chave() { return servidor + "|" + tipo; }
@@ -23,7 +25,7 @@ public final class Modelo {
     }
 
     public record Configuracao(String tipo, String unidade, boolean habilitada, long intervalo,
-                                BigDecimal minimo, BigDecimal maximo) {
+                                BigDecimal minimo, BigDecimal maximo, long empresa, String hostname, String componente) {
         public boolean aplicavel() { return habilitada && (minimo != null || maximo != null); }
 
         public String assinatura() {

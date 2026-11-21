@@ -77,15 +77,9 @@ public class Jira {
 
     public String criar(Ocorrencia o) throws IOException, InterruptedException {
         validarId(o.id);
-        String resumo = "StreamGuard servidor " + o.servidor + " " + o.tipo + ": " + o.valor + " " + o.unidade
-              + ", limite " + o.direcao + " " + o.limite + " " + o.unidade + ", " + o.instante;
-        if (resumo.length() > 255) resumo = resumo.substring(0, 255);
-        var campos = new IssueFieldsDto(new ProjectDto(projeto), resumo, new IssueTypeDto(tipo));
+        var campos = new IssueFieldsDto(new ProjectDto(projeto), resumo(o), new IssueTypeDto(tipo));
         campos.setLabels(List.of("streamguard", "sg-" + o.id));
-        String contexto = "Servidor: " + o.servidor + "\nMétrica: " + o.tipo + "\nValor: " + o.valor
-              + "\nLimite " + o.direcao + ": " + o.limite + "\nUnidade: " + o.unidade
-              + "\nHorário da amostra: " + o.instante + "\nOcorrência: " + o.id
-              + (o.encerradaEm == null ? "" : "\nEncerramento local: " + o.encerramento + " em " + o.encerradaEm);
+        String contexto = contexto(o);
         campos.setDescription(Map.of("type", "doc", "version", 1, "content", List.of(
               Map.of("type", "paragraph", "content", List.of(Map.of("type", "text", "text", contexto))))));
         String json = objectMapper.writeValueAsString(new IssueRequestDto(campos));
@@ -98,6 +92,37 @@ public class Jira {
         String chave = dados == null ? "" : dados.path("key").asText();
         if (!chave.matches("[A-Za-z][A-Za-z0-9_]*-[0-9]+")) throw new IOException("Jira respondeu sem chave válida.");
         return chave;
+    }
+
+    /** PUT dos campos atuais pode ser repetido sem adicionar comentários duplicados. */
+    public void atualizar(Ocorrencia o) throws IOException, InterruptedException {
+        if (o.issueKey == null || !o.issueKey.matches("[A-Za-z][A-Za-z0-9_]*-[0-9]+")) {
+            throw new IllegalArgumentException("Chave Jira inválida.");
+        }
+        String contexto = contexto(o);
+        var descricao = Map.of("type", "doc", "version", 1, "content", List.of(
+              Map.of("type", "paragraph", "content", List.of(Map.of("type", "text", "text", contexto)))));
+        String json = objectMapper.writeValueAsString(Map.of("fields", Map.of("summary", resumo(o), "description", descricao)));
+        var resposta = httpClient.send(pedido("/rest/api/3/issue/" + o.issueKey)
+              .PUT(HttpRequest.BodyPublishers.ofString(json)).build(), HttpResponse.BodyHandlers.ofString());
+        if (resposta.statusCode() != 204 && resposta.statusCode() != 200) {
+            throw new Recusado(resposta.statusCode(), retryAfter(resposta));
+        }
+    }
+
+    public String url(String chave) { return baseUrl + "/browse/" + chave; }
+
+    public static String resumo(Ocorrencia o) {
+        String texto = (o.teste ? "[HOMOLOGAÇÃO] " : "") + "StreamGuard servidor " + o.servidor + " " + o.tipo + ": " + o.valor + " " + o.unidade;
+        return texto.substring(0, Math.min(texto.length(), 255));
+    }
+
+    public static String contexto(Ocorrencia o) {
+        return (o.teste ? "Ambiente: HOMOLOGAÇÃO — amostra sintética isolada; não representa uma medição real.\n" : "")
+              + "Empresa: " + o.empresa + "\nServidor: " + o.servidor + " (" + o.hostname + ")"
+              + "\nComponente: " + o.componente + "\nMétrica: " + o.tipo + "\nValor: " + o.valor
+              + "\nLimite " + o.direcao + ": " + o.limite + "\nUnidade: " + o.unidade
+              + "\nHorário da amostra: " + o.ultimaAmostra + "\nOcorrência: " + o.id;
     }
 
     private HttpRequest.Builder pedido(String caminho) {

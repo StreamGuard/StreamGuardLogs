@@ -14,6 +14,8 @@ import java.io.Reader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
+import java.time.Clock;
+import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.time.format.ResolverStyle;
 import java.util.ArrayList;
@@ -21,40 +23,71 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Map;
+import java.util.Set;
 
 public final class Silver {
-    public static final String CHAVE = "silver/atual/metricas.csv";
     private static final DateTimeFormatter DATA =
           DateTimeFormatter.ofPattern("uuuu-MM-dd HH:mm:ss").withResolverStyle(ResolverStyle.STRICT);
     public record Snapshot(String versao, List<Medicao> medicoes, long rejeitados) {}
+    public record Particao(long empresa, Snapshot snapshot) {}
+    @FunctionalInterface
+    public interface Fonte { List<Particao> obter(Set<Long> empresas) throws IOException; }
 
     private final S3Client s3;
     private final String bucket;
     private final long maxBytes;
-    private Snapshot cache;
+    private final Map<String, Snapshot> cache = new LinkedHashMap<>();
+    private final Clock relogio;
+    private final String chaveLegada;
 
-    public Silver(S3Client s3, String bucket, long maxBytes) {
+    public Silver(S3Client s3, String bucket, long maxBytes, Clock relogio, String chaveLegada) {
         this.s3 = s3;
         this.bucket = bucket;
         this.maxBytes = maxBytes;
+        this.relogio = relogio;
+        this.chaveLegada = chaveLegada;
     }
 
-    public Optional<Snapshot> obter(String processada) throws IOException {
+    public List<Particao> obter(Set<Long> empresas) throws IOException {
+        var partes = new ArrayList<Particao>();
+        var procuradas = new java.util.HashSet<String>();
+        if (chaveLegada != null && !chaveLegada.isBlank()) {
+            procuradas.add(chaveLegada);
+            obter(chaveLegada).ifPresent(s -> partes.add(new Particao(0, s)));
+        } else {
+            for (long empresa : empresas) {
+                for (int atraso = 1; atraso >= 0; atraso--) {
+                    String chave = "silver/" + empresa + "/" + LocalDate.now(relogio).minusDays(atraso) + "/metricas.csv";
+                    procuradas.add(chave);
+                    obter(chave).ifPresent(s -> partes.add(new Particao(empresa, s)));
+                }
+            }
+        }
+        cache.keySet().retainAll(procuradas);
+        return partes;
+    }
+
+    private Optional<Snapshot> obter(String chave) throws IOException {
         try {
-            var cabecalho = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(CHAVE).build());
+            var cabecalho = s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(chave).build());
             String versao = cabecalho.eTag();
             if (versao == null || cabecalho.contentLength() == null || cabecalho.contentLength() > maxBytes) {
                 throw new IOException("Silver sem versão/tamanho válido ou acima de SILVER_MAX_BYTES.");
             }
-            if (versao.equals(processada)) return Optional.empty();
-            if (cache != null && cache.versao().equals(versao)) return Optional.of(cache);
-            var pedido = GetObjectRequest.builder().bucket(bucket).key(CHAVE).ifMatch(versao).build();
+            if (cache.containsKey(chave) && cache.get(chave).versao().equals(versao)) return Optional.of(cache.get(chave));
+            var pedido = GetObjectRequest.builder().bucket(bucket).key(chave).ifMatch(versao).build();
             try (var entrada = s3.getObject(pedido)) {
                 if (!versao.equals(entrada.response().eTag())) throw new IOException("Silver mudou durante a leitura.");
-                cache = ler(new InputStreamReader(entrada, StandardCharsets.UTF_8), versao);
-                return Optional.of(cache);
+                var snapshot = ler(new InputStreamReader(entrada, StandardCharsets.UTF_8), versao);
+                cache.put(chave, snapshot);
+                return Optional.of(snapshot);
             }
         } catch (S3Exception erro) {
+            if (erro.statusCode() == 404) {
+                cache.remove(chave);
+                return Optional.empty();
+            }
             throw new IOException("Falha de leitura Silver, HTTP " + erro.statusCode() + ".", erro);
         } catch (software.amazon.awssdk.core.exception.SdkException erro) {
             throw new IOException("Falha temporária de comunicação com a Silver.", erro);
