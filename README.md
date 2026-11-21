@@ -70,6 +70,12 @@ Os tipos incluem uso de CPU/RAM/disco, carga da CPU, memória disponível, taxas
 
 `ALERTAS_DESDE` aceita um horário local ISO sem offset, como `2026-11-19T12:00:00`, somente para definir o início de um estado novo. `SILVER_CHAVE` permite selecionar explicitamente outro objeto, inclusive o caminho legado `silver/atual/metricas.csv`.
 
+No ambiente StreamGuard atual, o banco chama-se `StreamGuard` (S maiúsculo); mantenha exatamente essa capitalização em `DB_DATABASE`, especialmente em hosts Linux. O usuário dedicado de alertas precisa de leitura no mesmo schema. Para conceder esse acesso após criar o usuário, use no MySQL:
+
+```sql
+GRANT SELECT ON `StreamGuard`.* TO 'streamguard_alertas'@'%';
+```
+
 Use o nome de tipo disponibilizado pelo projeto Jira, por exemplo `[System] Incident` quando aplicável. Falhas de renovação das configurações suspendem os envios até que o banco volte a responder. Os limites não são substituídos por valores fixos do código.
 
 ## Execução na EC2
